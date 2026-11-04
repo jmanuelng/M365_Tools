@@ -11,6 +11,10 @@ A collection of practical, generic PowerShell tools for Microsoft 365 administra
 | Exchange Online | [exchange/](exchange/) | Coming soon | |
 | Intune | [intune/](intune/) | Coming soon | |
 
+## Best practices
+
+See [BEST_PRACTICES.md](BEST_PRACTICES.md): lessons learned running Microsoft Graph scripts at tenant scale (unique-permission scans, batching, throttling, timeouts, parallelism, resume, security).
+
 ## Principles
 
 - **Read-only unless stated otherwise.** A tool that changes anything says so at the top of its README.

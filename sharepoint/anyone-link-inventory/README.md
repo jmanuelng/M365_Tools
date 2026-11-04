@@ -229,6 +229,8 @@ When you are done:
 - **Resume / skip list:** a drive is skipped if its drive ID *or* its web URL appears (tab-separated) in `done.txt`, so you can seed `done.txt` with one drive URL per line to skip drives finished by an earlier run or tool.
 - **Watchdog:** if no Graph call completes for `-NoActivityTimeoutMinutes`, the run stops cleanly with exit code 3 and can be resumed.
 
+For the reasoning behind these choices, see [Best practices](../../BEST_PRACTICES.md).
+
 ## Troubleshooting
 
 | Symptom | Cause / fix |
