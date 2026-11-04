@@ -1,0 +1,25 @@
+# Certificates and keys - never commit
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+certs/
+secrets/
+*.secret
+.env
+# Script output
+output/
+*_output/
+*.csv
+*.xlsx
+*.log
+*_parts/
+*_done.txt
+*_progress.txt
+*_checkpoint/
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
