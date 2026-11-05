@@ -1,0 +1,33 @@
+{
+  "aAAAAA1": {
+    "id": "aAAAAA1",
+    "roles": ["write"],
+    "link": { "scope": "anonymous", "type": "edit", "webUrl": "https://contoso.sharepoint.com/:x:/g/personal/user_contoso_onmicrosoft_com/EdItLinkSample01" }
+  },
+  "aAAAAA2": {
+    "id": "aAAAAA2",
+    "roles": ["read"],
+    "link": { "scope": "anonymous", "type": "view", "webUrl": "https://contoso.sharepoint.com/:x:/g/personal/user_contoso_onmicrosoft_com/ViEwLinkSample02" }
+  },
+  "aAAAAA3": {
+    "id": "aAAAAA3",
+    "roles": ["write"],
+    "link": { "scope": "organization", "type": "edit", "webUrl": "https://contoso.sharepoint.com/:x:/s/Finance/OrgLinkSample03" }
+  },
+  "aAAAAA4": {
+    "id": "aAAAAA4",
+    "roles": ["write"],
+    "link": { "scope": "anonymous", "type": "edit", "webUrl": "https://contoso.sharepoint.com/:f:/s/Finance/EdItFolderSample04" }
+  },
+  "aAAAAA5": {
+    "id": "aAAAAA5",
+    "roles": ["write"],
+    "inheritedFrom": { "id": "01ITEMFOLD000000000000000000000004", "path": "/drives/b!DRIVEIDORG000000000000000000000000000000000000000000000000002/root:/SharedFolder" },
+    "link": { "scope": "anonymous", "type": "edit", "webUrl": "https://contoso.sharepoint.com/:x:/s/Finance/InheritedSample05" }
+  },
+  "changed": {
+    "id": "aAAAAA1",
+    "roles": ["read"],
+    "link": { "scope": "anonymous", "type": "view", "webUrl": "https://contoso.sharepoint.com/:x:/g/personal/user_contoso_onmicrosoft_com/EdItLinkSample01" }
+  }
+}
