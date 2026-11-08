@@ -36,7 +36,7 @@ Write-Host "=== Help ===" -ForegroundColor Cyan
 Assert-True ((Get-ExitCode) -eq 0) '-Help exits cleanly'
 $raw=Get-Content $Script -Raw
 Assert-True ($raw -match 'TENANT-AGNOSTIC / PUBLISH-SAFE CONTRACT') 'help states generic publication contract'
-Assert-True ($raw -match "ScriptVersion = '1\.1\.0-preview\.1'") 'version is explicitly preview'
+Assert-True ($raw -match "ScriptVersion = '1\.1\.0-preview\.2'") 'version is explicitly preview'
 
 Write-Host "=== Mock dry-run (default: no DELETE) ===" -ForegroundColor Cyan
 $out1 = Join-Path $Root 'output/test_dryrun'

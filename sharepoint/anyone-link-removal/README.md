@@ -1,8 +1,8 @@
-> **1.1.0-preview.1 — offline validation only.** This generic update passed 39 offline assertions; it has not been live-tested. Production operations performed with a separate purpose-specific executor are not validation of this preview. Test in a non-production tenant first. See [safety/progress semantics](docs/SAFETY_AND_PROGRESS.md).
+> **1.1.0-preview.2 — offline validation only.** This generic update passed140 offline assertions across three regression/fault-injection suites; it has not been live-tested. Production operations performed with a separate purpose-specific executor are not validation of this preview. Test in a non-production tenant first. See [safety/progress semantics](docs/SAFETY_AND_PROGRESS.md).
 
 # Remove "Anyone" edit sharing links in SharePoint Online and OneDrive
 
-**Applies to:** SharePoint Online, OneDrive for Business, Microsoft Graph v1.0 · **Scripts:** `Remove-AnyoneLink.ps1` v1.1.0-preview.1 · `Grant-SitesSelectedWrite.ps1` v1.0.0 · **Updated:** 2026-11-07 · **Access:** **CHANGES TENANT STATE** (deletes sharing permissions)
+**Applies to:** SharePoint Online, OneDrive for Business, Microsoft Graph v1.0 · **Scripts:** `Remove-AnyoneLink.ps1` v1.1.0-preview.2 · `Grant-SitesSelectedWrite.ps1` v1.0.0 · **Updated:** 2026-11-08 · **Access:** **CHANGES TENANT STATE** (deletes sharing permissions)
 
 > **This tool mutates the tenant.** It deletes Microsoft Graph `permission` objects that represent **Anyone (anonymous) edit** sharing links. It does **not** delete files, folders, or sites. Deleting a sharing link **cannot restore the same URL** — owners must create a new link if access is still required.
 >
@@ -34,10 +34,10 @@ Plus [Sites.Selected (tighter alternative)](#sitesselected-tighter-alternative),
 | Dry-run default | Without `-Execute`, the script only GETs and writes `would_delete.csv` |
 | `-WhatIf` | Honored via `SupportsShouldProcess`; no DELETE even with `-Execute` |
 | Fresh check | Every candidate is re-fetched with `GET .../permissions/{id}` before any delete |
-| Allowlist shape | Must be `link.scope=anonymous`, edit/write, `inheritedFrom` null, id matches CSV |
+| Allowlist shape | Must be `link.scope=anonymous`, exact `link.type=edit`, `inheritedFrom` null, id matches CSV |
 | Inherited | Skipped (Graph cannot delete inherited permissions) |
-| Mutation retries | DELETE retried only on 429/503/504 after a fresh allowlist re-check; never blind |
-| Resume | `done.txt` keys `DriveId\|ItemId\|LinkId` |
+| Mutation retries | DELETE retried only on429/503/504 after server delay, permission/item reconciliation and fresh shape guard; timeout/acknowledged deletion never auto-replayed |
+| Resume | Explicit `-Resume`; fsynced journal-proven permission404 AND matching item200; legacy checkpoints re-read |
 | Mock | `-MockGraph` never contacts Entra or Graph |
 | App separation | Do **not** reuse the read-only inventory app or expand its permissions |
 | Publish-safe | No tenant IDs, hostnames, or UPNs hardcoded — parameters / prompts only |
@@ -156,7 +156,11 @@ Or: `pwsh ./tests/Test-RemoveAnyoneLink.ps1`.
 
 Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
 
-### Step 2: live DELETE on the same short list
+### Step 2: obtain exact-scope approval, then live DELETE on the same short list
+
+Record the reviewed CSV SHA256 and recipient/restore impact. A successful dry-run or
+previous batch is not approval. Supply the independently reviewed hash with
+`-ExpectedInputSha256 $approvedHash`; see full help for a complete auth-splat example.
 
 ```powershell
 .\Remove-AnyoneLink.ps1 -TenantId contoso.onmicrosoft.com `
@@ -168,7 +172,7 @@ Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
     -Execute -Confirm
 ```
 
-### Unattended (only after a successful interactive pilot)
+### Unattended (only after explicit approval of this exact cohort)
 
 ```powershell
 .\Remove-AnyoneLink.ps1 -TenantId ... -ClientId ... -CertificateThumbprint ... `
@@ -196,7 +200,11 @@ Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
 | `-RequestTimeoutSeconds` | no | 30 | Per-call connection/operation limits; not a hard watchdog |
 | `-MaxRetryDelaySeconds` | no | 60 | Pause if server backoff exceeds budget |
 | `-MaxRunSeconds` | no | 3600 | Cooperative overall budget |
-| `-MaxDeleteRetries` | no | 1 | Transient-only, verified and freshly guarded replay |
+| `-MaxDeleteRetries` | no | 1 | Additional429/503/504 attempts only after reconciliation; never timeout/confirmed replay |
+| `-MaxReadRetries` | no | 3 | Additional GET attempts in every phase for transient0/408/429/500/502/503/504 |
+| `-MaxVerificationPolls` | no | 3 | Additional post-DELETE permission200 polls; never a DELETE retry |
+| `-ExpectedInputSha256` | no | none | Independently reviewed exact CSV SHA256;64 hex characters |
+| `-Resume` | existing journal | off | Same immutable input/context; reconcile incomplete mutations before any write |
 | `-ThrottleLimit` | no | 2 | Reserved compatibility parameter; requests are sequential |
 | `-Help` | no | | Full comment-based help |
 
@@ -207,22 +215,39 @@ Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
 | File | Content |
 |---|---|
 | `would_delete.csv` | Rows that passed live allowlist checks |
-| `skipped.csv` | Inherited / wrong scope / missing / GET errors |
+| `skipped.csv` | Changed/inherited/disallowed shapes; request errors are in removal_results.csv |
 | `removal_results.csv` | Dry-run plans and (if `-Execute`) delete outcomes |
-| `done.txt` | Verified terminal execution checkpoints only; no dry-run/skip entries |
+| `done.txt` | Compatibility projection only; journal is authoritative |
 | `input_sha256.txt` | Binds output folder to exact input bytes |
-| `mutation_journal.jsonl` | Durable attempt/response/verified journal |
+| `mutation_journal.jsonl` | Fsynced ATTEMPT/RESPONSE/VERIFIED; VERIFIED includes permission404/item200 proof |
+| `request_receipts.jsonl` | Sanitized per-phase key/method/intent/status/exception-type receipts |
+| `execution_context.json` | Binds output to tenant/client/mock mode; no certificate/password/token |
+| `execution.lock` | Exclusive per-output process lock; not a distributed tenant lock |
 | `summary.json` | Atomic per-row counts and completion/pause state |
 | `run_*.log` | Full log |
 | `progress.txt` | Heartbeat counters |
 
 `Action` values: `WOULD_DELETE`, `DELETED`, `ALREADY_ABSENT`, `ERROR`, `SKIP`.
 `Completed` means all selected rows were examined, not that all were deleted.
+`ExecutionComplete` additionally requires Execute and every selected outcome verified
+(permission404 plus matching item200), with no plans/skips/errors. Historical failure
+responses and current-run errors are separate; `Remaining` excludes examined errors,
+which appear in `UnresolvedProcessed`. See the complete [counter/recovery contract](docs/SAFETY_AND_PROGRESS.md).
 Errors/auth failures pause with nonzero exit. An unresolved prior mutation requires
 operator review; do not remove its journal merely to force a replay. Default dry-run
 and `-WhatIf` never create mutation checkpoints. Reusing an output folder with changed
 input bytes fails; use a new folder. Run one writer per folder. Local checkpoint
 files are not a multi-file transaction; retain them together and inspect storage errors.
+
+### Resume or read-only uncertain-result reconciliation
+
+Preserve the entire folder and input bytes. Add `-Resume` to the same invocation.
+Without `-Execute`, it performs read-only reconciliation; it cannot create mutation
+checkpoints. With existing exact-scope approval and `-Execute -Resume`, a confirmed
+absent permission plus matching item can be checkpointed without another DELETE.
+A still-present unresolved permission, truncated journal or context mismatch pauses.
+Do not clear receipts or use a new folder to evade the no-replay safeguard. Full
+commands and limits are in `Get-Help ./Remove-AnyoneLink.ps1 -Full`.
 
 ## 9. Clean up (security)
 
@@ -249,7 +274,10 @@ For a pilot limited to known sites / OneDrives:
 - **Fresh GET** of `GET /drives/{driveId}/items/{itemId}/permissions/{linkId}` before delete; allowlist re-check before every retry.
 - **StrictMode-safe Graph I/O:** `Invoke-WebRequest -SkipHttpErrorCheck`; GET **404** = already gone; DELETE **204** = success; status codes unwrapped without assuming `ErrorRecord.StatusCode` exists.
 - **Token role allow/deny** checked after client-credentials auth.
-- **Resume** via `done.txt`.
+- **Resume** via fsynced journal with explicit `-Resume`; `done.txt` alone is never proof.
+- **Item retained** requires GET200 with matching item ID after exact permission404.
+- **Bounded GET recovery** covers transient transport timeouts in precheck and both verification phases.
+- **Clock guard** compares UTC wall time and Stopwatch; a separate suspend-aware watchdog is still required.
 
 See also [BEST_PRACTICES.md](../../BEST_PRACTICES.md) (§11 write tools, §12 publishing).
 
@@ -260,10 +288,10 @@ See also [BEST_PRACTICES.md](../../BEST_PRACTICES.md) (§11 write tools, §12 pu
 | `INPUT ERROR` / exit 2 | Missing/invalid parameter under `-NonInteractive`, or bad CSV columns |
 | Token / AADSTS errors | Wrong TenantId/ClientId/cert; see inventory README troubleshooting |
 | Token contains DENIED role | Removal app has FullControl/Manage — remove it |
-| Token roles do not include AllowedPermissionIds | Consent `Files.ReadWrite.All` or pass Sites.Selected GUID in `-AllowedPermissionIds` |
-| Many SKIP inherited | Expected for child items under a shared folder — delete the folder link instead |
+| Token roles do not include AllowedPermissionIds | Stop and review existing app authorization; separately approve any grant change, never auto-escalate |
+| Many SKIP inherited | Expected under shared folders; review any parent permission separately, never substitute it into this approved list |
 | `ERROR` / paused | Inspect sanitized log, mutation journal and exact state before any retry; never blindly replay an uncertain DELETE |
-| 403 on personal OneDrive with Sites.Selected | Grant write on that site with an app-only FullControl bootstrap, or use Files.ReadWrite.All |
+| 403 on personal OneDrive with Sites.Selected | Stop; independently review site scope/authorization. This run does not authorize bootstrap or broader permissions |
 
 ## FAQ
 
