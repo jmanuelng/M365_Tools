@@ -28,10 +28,8 @@
     requested by default. For a site-scoped pilot, Sites.Selected + per-site write is preferred.
 
     TENANT-AGNOSTIC / PUBLISH-SAFE CONTRACT:
-      * No tenant ID, client ID, certificate thumbprint/path, hostname, UPN, or output path is hardcoded.
-      * Every tenant-specific value is a parameter (or an interactive prompt with format checks and
-        where-to-find guidance). Placeholders in examples use contoso.onmicrosoft.com and 00000000-... only.
-      * -NonInteractive fails clearly with exit code 2 when a required value is missing or invalid.
+      * Tenant/client IDs, certificates, input and output are parameters, never tenant-specific constants.
+      * Examples use placeholders only. -NonInteractive fails missing/invalid input with exit2.
 
     Required values you omit as parameters are prompted for (with validation and where-to-find hints),
     unless -NonInteractive is set (then missing values fail immediately with exit code 2).
@@ -85,12 +83,21 @@
     Override path to mock permissions JSON (default: <scriptDir>/mocks/permissions.json).
 
 .PARAMETER ThrottleLimit
-    Max parallel workers for fresh GETs (1-4, default 2). Keep low; deletions stay sequential.
+    Reserved compatibility parameter; the implementation is SEQUENTIAL, not parallel.
 
 .PARAMETER MaxDeleteRetries
-    Max DELETE retries on 429/503/504 only (default 3). Never retries a successful DELETE or a 4xx
-    other than 429.
+    Max DELETE retries on 429/503/504 only (default 1). Never retries a successful DELETE or a 4xx
+    other than 429. Ambiguous mutation is verified before any retry.
 
+.PARAMETER RequestTimeoutSeconds
+    Per-request connection/operation timeout (default30). OS/HTTP stacks can exceed it;
+    use an external process watchdog for a hard wall-clock bound. Never replay pending mutations.
+.PARAMETER MaxRetryDelaySeconds
+    Maximum accepted server backoff (default60); longer/invalid Retry-After stops instead
+    of retrying earlier than the server permits. Supports seconds and HTTP-date values.
+.PARAMETER MaxRunSeconds
+    Cooperative run budget (default3600); checked between requests and waits, not an
+    independent timer. In-flight OS calls need an external supervisor for hard cancellation.
 .PARAMETER NonInteractive
     Never prompt. Missing/invalid required values fail with exit code 2.
 
@@ -116,19 +123,18 @@
 
 .NOTES
     Name     : Remove-AnyoneLink.ps1
-    Version  : 1.0.0
-    Date     : 2026-11-05
+    Version  : 1.1.0-preview.1
+    Date     : 2026-11-07
     License  : MIT
     Requires : PowerShell 7.4+. No Graph SDK modules required (raw REST).
+    Validation: Offline mock tests only for this preview; validate in a test tenant before use.
 
     CHANGELOG
-      1.0.0  2026-11-05  Public tenant-agnostic release. Dry-run default, -Execute opt-in,
-                         fresh permission GET, inherited/skip guards, cert auth, mock tests,
-                         token role allowlist/denylist, resume via done.txt. Graph calls use
-                         -SkipHttpErrorCheck; GET 404 = already gone; DELETE 204 = success;
-                         StrictMode-safe StatusCode unwrap (Get-HttpStatusFromError, Get-NoteProp).
-      0.1.x  2026-11-05  Pre-publish staging prove-out (not in this repo): StrictMode 204/404
-                         fix, Get-NoteProp, first dry-run / Execute build.
+      1.1.0-preview.1  2026-11-07  Bounded/status-safe transport; no inner DELETE retry;
+                                 verify ambiguous mutations before any retry; durable journal;
+                                 incremental CSV/checkpoints, every-row progress/final counts;
+                                 input hash binding, fail-closed auth/errors, strict edit shape.
+      1.0.0          2026-11-05  Initial public dry-run/Execute tool and safety gates.
 
     SOURCES
       Microsoft Learn - Remove access (permission-delete):
@@ -147,7 +153,7 @@
       Sibling inventory tool patterns: M365_Tools/sharepoint/anyone-link-inventory + BEST_PRACTICES.md
 
 .LINK
-    README.md in the same folder (full setup guide). See also ../../BEST_PRACTICES.md.
+    README.md and docs/SAFETY_AND_PROGRESS.md in this folder; ../../BEST_PRACTICES.md.
 #>
 #Requires -Version 7.4
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'Path')]
@@ -161,7 +167,7 @@ param(
     [string]$OutputFolder = (Join-Path (Get-Location) "AnyoneLinkRemoval_$(Get-Date -Format yyyyMMdd)"),
     [ValidateRange(0, [int]::MaxValue)][int]$MaxItems = 0,
     [bool]$RequireAnonymousEdit = $true,
-    # Microsoft Graph published application permission IDs (not tenant-specific) — safe defaults.
+    # Microsoft Graph published application permission IDs, not tenant/app IDs.
     [string[]]$AllowedPermissionIds = @('75359482-378d-4052-8f01-80520e7db3cd'), # Files.ReadWrite.All
     [string[]]$DeniedPermissionIds = @(
         'a82116e5-55eb-4c41-a434-62fe8a61c773', # Sites.FullControl.All Application
@@ -171,17 +177,18 @@ param(
     [switch]$MockGraph,
     [string]$MockPermissionsPath,
     [ValidateRange(1, 4)][int]$ThrottleLimit = 2,
-    [ValidateRange(0, 5)][int]$MaxDeleteRetries = 3,
+    [ValidateRange(0, 5)][int]$MaxDeleteRetries = 1,
+    [ValidateRange(1, 120)][int]$RequestTimeoutSeconds = 30,
+    [ValidateRange(0, 300)][int]$MaxRetryDelaySeconds = 60,
+    [ValidateRange(1, 86400)][int]$MaxRunSeconds = 3600,
     [switch]$NonInteractive,
     [Alias('h', '?')][switch]$Help
 )
 
-# StrictMode Latest: missing properties throw. All Graph JSON access must use Get-NoteProp /
-# PSObject.Properties checks — never assume .link.webUrl or ErrorRecord.StatusCode exist.
+# Never assume optional nested JSON or ErrorRecord properties exist.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 function Get-NoteProp($obj, [string]$Name) {
-    # Safe nested property read under StrictMode (Graph permission JSON is uneven).
     if ($null -eq $obj) { return $null }
     $prop = $obj.PSObject.Properties[$Name]
     if ($null -eq $prop) { return $null }
@@ -189,7 +196,7 @@ function Get-NoteProp($obj, [string]$Name) {
 }
 
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0-preview.1'
 $ScriptDir = Split-Path -Parent $PSCommandPath
 
 # Canonical denied application permission IDs (Microsoft Graph permissions reference, verified 2026-11-05)
@@ -257,6 +264,12 @@ $resultCsv = Join-Path $OutputFolder 'removal_results.csv'
 $planCsv = Join-Path $OutputFolder 'would_delete.csv'
 $skipCsv = Join-Path $OutputFolder 'skipped.csv'
 $progressFile = Join-Path $OutputFolder 'progress.txt'
+$summaryFile = Join-Path $OutputFolder 'summary.json'
+$journalFile = Join-Path $OutputFolder 'mutation_journal.jsonl'
+$runId = [guid]::NewGuid().ToString()
+$runStarted = [datetime]::UtcNow
+$runDeadline = $runStarted.AddSeconds($MaxRunSeconds)
+
 
 function Write-Log([string]$Msg, [string]$Level = 'INFO') {
     $line = '{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}' -f (Get-Date), $Level, $Msg
@@ -289,14 +302,25 @@ foreach ($c in $requiredCols) {
 }
 
 function Test-IsAnonymousEdit($r) {
-    $scope = [string]$r.Scope
-    $type = [string]$r.LinkType
-    $roles = [string]$r.Roles
+    $scope = [string](Get-NoteProp $r 'Scope')
+    $type = [string](Get-NoteProp $r 'LinkType')
+    $roles = [string](Get-NoteProp $r 'Roles')
     $anon = $scope -eq 'anonymous'
     $edit = ($type -eq 'edit') -or ($roles -match '(?i)\bwrite\b')
     return ($anon -and $edit)
 }
 
+# Reject ambiguous/blank targets rather than silently widening or repeating a cohort.
+$inputKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($r in $rows) {
+    foreach ($c in $requiredCols) { if ([string]::IsNullOrWhiteSpace([string]$r.$c)) { Fail-Input "Blank required target column '$c'." } }
+    if (-not $inputKeys.Add(('{0}|{1}|{2}' -f $r.DriveId,$r.ItemId,$r.LinkId))) { Fail-Input 'Duplicate DriveId|ItemId|LinkId target.' }
+}
+$inputHash = (Get-FileHash -LiteralPath $InputCsv -Algorithm SHA256).Hash
+$manifestFile = Join-Path $OutputFolder 'input_sha256.txt'
+if (Test-Path $manifestFile) {
+    if ((Get-Content $manifestFile -Raw).Trim() -ne $inputHash) { Fail-Input 'OutputFolder belongs to a different input hash; use a new folder.' }
+} else { Set-Content -LiteralPath $manifestFile -Value $inputHash -WhatIf:$false }
 $candidates = @($rows)
 if ($RequireAnonymousEdit) {
     $candidates = @($candidates | Where-Object { Test-IsAnonymousEdit $_ })
@@ -308,17 +332,20 @@ if (Test-Path -LiteralPath $doneFile) {
         $t = $_.Trim(); if ($t) { [void]$doneSet.Add($t) }
     }
 }
+$beforeResume = $candidates.Count
 $candidates = @($candidates | Where-Object {
         $key = '{0}|{1}|{2}' -f $_.DriveId, $_.ItemId, $_.LinkId
         -not $doneSet.Contains($key)
     })
+$resumedCount = $beforeResume - $candidates.Count
 if ($MaxItems -gt 0 -and $candidates.Count -gt $MaxItems) {
     $candidates = @($candidates | Select-Object -First $MaxItems)
 }
 Write-Log ("Candidates after filter/resume/MaxItems: {0} (RequireAnonymousEdit={1})" -f $candidates.Count, $RequireAnonymousEdit)
 
 if ($candidates.Count -eq 0) {
-    Write-Log 'Nothing to process.' 'OK'
+    Write-Log 'Nothing to process; zero pending targets (not a new deletion).' 'OK'
+    @{RunId=$runId;Mode='NO_PENDING';Total=0;Processed=0;Remaining=0;ResumedCompleted=$resumedCount;EligibleChecked=0;WouldDelete=0;DeletedVerified=0;AlreadyAbsent=0;Skipped=0;Errors=0;Paused=$false;Completed=$true;UpdatedUtc=[datetime]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content $summaryFile -WhatIf:$false
     exit 0
 }
 
@@ -397,7 +424,7 @@ function Get-GraphToken($S) {
                 client_assertion_type = 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'; client_assertion = "$h.$p.$sig"
             }
         } catch {
-            throw "Token request failed. Check TenantId/ClientId/certificate/admin consent. $($_.Exception.Message) $($_.ErrorDetails.Message)"
+            throw "Token acquisition failed; check tenant/client/certificate/admin consent. Type=$($_.Exception.GetType().Name). Raw service response suppressed."
         }
         $S.Token = $r.access_token; $S.Exp = [datetime]::UtcNow.AddMinutes(45)
         Assert-TokenRoles $S.Token
@@ -447,104 +474,105 @@ function Assert-TokenRoles([string]$jwt) {
     }
 }
 
-function Get-HttpStatusFromError {
-    # StrictMode-safe unwrap. Never read .StatusCode unless the property exists.
-    # Lesson: throwing a pscustomobject status bag, then reading ErrorRecord.StatusCode under
-    # StrictMode, falsely marked successful DELETE (HTTP 204 + verify GET 404) as DELETE_FAILED.
-    param($ErrorRecord)
-    if ($null -eq $ErrorRecord) { return 0 }
-    $target = $null
-    $ex = $null
-    if ($ErrorRecord -is [System.Management.Automation.ErrorRecord]) {
-        $target = $ErrorRecord.TargetObject
-        $ex = $ErrorRecord.Exception
-    } elseif ($ErrorRecord -is [pscustomobject]) {
-        $target = $ErrorRecord
-    }
-    if ($target -is [pscustomobject]) {
-        $p = $target.PSObject.Properties['StatusCode']
-        if ($null -ne $p -and $null -ne $p.Value) { return [int]$p.Value }
-    }
-    if ($null -ne $ex) {
-        $p = $ex.PSObject.Properties['StatusCode']
-        if ($null -ne $p -and $null -ne $p.Value) { return [int]$p.Value }
-        $rp = $ex.PSObject.Properties['Response']
-        if ($null -ne $rp -and $null -ne $rp.Value) {
-            $sp = $rp.Value.PSObject.Properties['StatusCode']
-            if ($null -ne $sp -and $null -ne $sp.Value) { return [int]$sp.Value }
+function Get-HttpFailureInfo($ErrorRecord) {
+    # Inspect only documented status/header locations, never stringify request/auth bodies.
+    $queue = [Collections.Generic.Queue[object]]::new()
+    $seen = [Collections.Generic.HashSet[object]]::new()
+    if ($null -ne $ErrorRecord) { $queue.Enqueue($ErrorRecord) }
+    $status = 0; $retry = $null
+    while ($queue.Count -gt 0 -and $seen.Count -lt 16) {
+        $obj = $queue.Dequeue()
+        if ($null -eq $obj -or -not $seen.Add($obj)) { continue }
+        foreach ($name in @('StatusCode','ResponseStatusCode')) {
+            $v = Get-NoteProp $obj $name
+            if ($null -ne $v) { try { $status = [int]$v } catch {} }
+        }
+        $data = Get-NoteProp $obj 'Data'
+        if ($data -and $data.Contains('StatusCode')) { $status = [int]$data['StatusCode'] }
+        if ($data -and $data.Contains('RetryAfter')) { $retry = $data['RetryAfter'] }
+        $headers = Get-NoteProp $obj 'Headers'
+        if ($headers) {
+            try { $v = @($headers['Retry-After']); if ($v.Count -and $v[0]) { $retry = [string]$v[0] } } catch {}
+        }
+        foreach ($name in @('Exception','InnerException','Response','TargetObject')) {
+            $v = Get-NoteProp $obj $name
+            if ($null -ne $v) { $queue.Enqueue($v) }
         }
     }
-    return 0
+    return @{ StatusCode=$status; RetryAfter=$retry }
 }
-
+function Get-HttpStatusFromError($ErrorRecord) { return (Get-HttpFailureInfo $ErrorRecord).StatusCode }
+function New-GraphFailure([int]$Status,[string]$RetryAfter,[string]$Kind) {
+    $ex = [InvalidOperationException]::new("Graph $Kind HTTP $Status; paused/error, not success.")
+    $ex.Data['StatusCode'] = $Status
+    if ($RetryAfter) { $ex.Data['RetryAfter'] = $RetryAfter }
+    return $ex
+}
+function Get-RetryDelay([string]$RetryAfter,[int]$Attempt) {
+    if ($RetryAfter) {
+        $seconds = 0
+        if ([int]::TryParse($RetryAfter,[ref]$seconds)) { return [math]::Max(0,$seconds) }
+        $date = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($RetryAfter,[ref]$date)) { return [math]::Max(0,[math]::Ceiling(($date-[DateTimeOffset]::UtcNow).TotalSeconds)) }
+        throw (New-GraphFailure 429 '' 'invalid Retry-After')
+    }
+    return [math]::Min(30,[math]::Pow(2,$Attempt))
+}
+function Wait-GraphRetry([string]$RetryAfter,[int]$Attempt) {
+    $seconds = Get-RetryDelay $RetryAfter $Attempt
+    # Never shorten a server Retry-After to fit our budget: stop instead.
+    if ($seconds -gt $MaxRetryDelaySeconds -or [datetime]::UtcNow.AddSeconds($seconds+$RequestTimeoutSeconds) -ge $runDeadline) {
+        throw (New-GraphFailure 429 $RetryAfter 'retry budget exceeded')
+    }
+    Write-Log "Backing off ${seconds}s; next operation rechecks current state." 'WARN'
+    Start-Sleep -Seconds $seconds
+}
 function Invoke-Graph {
-    param(
-        [ValidateSet('GET', 'DELETE')][string]$Method,
-        [Parameter(Mandatory)][string]$Uri,
-        [int]$MaxRetry = 5
-    )
-    if ($MockGraph) { throw 'Invoke-Graph should not be used directly under MockGraph for item calls.' }
+    param([ValidateSet('GET','DELETE')][string]$Method,[Parameter(Mandatory)][string]$Uri,[int]$MaxRetry=2)
+    if ($MockGraph) { throw 'Transport is unavailable under MockGraph.' }
     $attempt = 0
     while ($true) {
+        if ([datetime]::UtcNow -ge $runDeadline) { throw (New-GraphFailure 0 '' 'run time budget exceeded') }
         $attempt++
         $token = Get-GraphToken $S
-        $headers = @{
-            Authorization = "Bearer $token"
-            'User-Agent'  = "Remove-AnyoneLink/$ScriptVersion"
-        }
+        $headers = @{ Authorization="Bearer $token"; 'User-Agent'="Remove-AnyoneLink/$ScriptVersion" }
         try {
-            # SkipHttpErrorCheck: Graph 204/404 must not throw; StrictMode + thrown pscustomobject
-            # previously broke StatusCode unwrap on ErrorRecord (lesson 2026-11-05).
-            $resp = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $headers `
-                -SkipHttpErrorCheck `
-                -ConnectionTimeoutSeconds 60 -OperationTimeoutSeconds 120
-            $S.LastActivity = [datetime]::UtcNow
-            $status = [int]$resp.StatusCode
-            $retryAfter = $null
-            try {
-                if ($resp.Headers -and $resp.Headers.ContainsKey('Retry-After')) {
-                    $retryAfter = @($resp.Headers['Retry-After'])[0]
-                }
-            } catch { }
-            if ($status -in 429, 503, 504 -and $attempt -le $MaxRetry) {
-                $wait = if ($retryAfter) { [int]$retryAfter } else { [math]::Min(60, [math]::Pow(2, $attempt)) + (Get-Random -Minimum 0.0 -Maximum 1.0) }
-                Write-Log "Throttle/server $status on $Method $Uri; backing off ${wait}s (attempt $attempt/$MaxRetry)" 'WARN'
-                Start-Sleep -Seconds $wait
-                continue
-            }
-            if ($Method -eq 'GET') {
-                if ($status -eq 404) { return $null }
-                if ($status -lt 200 -or $status -ge 300) {
-                    throw ("Graph GET HTTP {0}: {1}" -f $status, $resp.Content)
-                }
-                if ([string]::IsNullOrWhiteSpace([string]$resp.Content)) { return $null }
-                return ($resp.Content | ConvertFrom-Json)
-            }
-            # DELETE: 204 No Content is success; 404 means already gone
-            if ($status -in 200, 202, 204, 404) {
-                return [pscustomobject]@{ StatusCode = $status }
-            }
-            throw ("Graph DELETE HTTP {0}: {1}" -f $status, $resp.Content)
+            $resp = Invoke-WebRequest -Method $Method -Uri $Uri -Headers $headers -SkipHttpErrorCheck `
+                -ConnectionTimeoutSeconds $RequestTimeoutSeconds -OperationTimeoutSeconds $RequestTimeoutSeconds -ErrorAction Stop
         } catch {
-            # Transport failures only (HTTP status path above does not use Exception.Response)
-            $status = Get-HttpStatusFromError $_
-            $retryAfter = $null
-            if ($status -in 429, 503, 504 -and $attempt -le $MaxRetry) {
-                $wait = if ($retryAfter) { [int]$retryAfter } else { [math]::Min(60, [math]::Pow(2, $attempt)) + (Get-Random -Minimum 0.0 -Maximum 1.0) }
-                Write-Log "Throttle/server $status on $Method $Uri; backing off ${wait}s (attempt $attempt/$MaxRetry)" 'WARN'
-                Start-Sleep -Seconds $wait
-                continue
+            # DELETE has NO transport-layer retries. Only the caller may consider a new
+            # mutation, after verifying absence/shape and applying the retry policy.
+            $info = Get-HttpFailureInfo $_
+            if ($Method -eq 'GET' -and $info.StatusCode -in @(429,503,504) -and $attempt -le $MaxRetry) {
+                Wait-GraphRetry $info.RetryAfter $attempt; continue
             }
             throw
         }
+        $S.LastActivity = [datetime]::UtcNow
+        $status = [int]$resp.StatusCode; $retry = $null
+        try { $retry = [string](@($resp.Headers['Retry-After'])[0]) } catch {}
+        if ($Method -eq 'GET' -and $status -in @(429,503,504) -and $attempt -le $MaxRetry) {
+            Wait-GraphRetry $retry $attempt; continue
+        }
+        if ($Method -eq 'GET') {
+            if ($status -eq 404) { return $null }
+            # Only explicit404 means absent. Empty/malformed200 is NOT absence.
+            if ($status -ne 200 -or [string]::IsNullOrWhiteSpace([string]$resp.Content)) { throw (New-GraphFailure $status $retry 'GET') }
+            return ($resp.Content | ConvertFrom-Json -ErrorAction Stop)
+        }
+        if ($status -in @(200,202,204,404)) { return [pscustomobject]@{StatusCode=$status} }
+        throw (New-GraphFailure $status $retry 'DELETE')
     }
 }
 
 function Get-PermissionFresh([string]$DriveId, [string]$ItemId, [string]$LinkId) {
     if ($MockGraph) {
         if ($script:DeletedMock.Contains($LinkId)) { return $null }
-        $node = $script:MockMap.$LinkId
+        $node = Get-NoteProp $script:MockMap $LinkId
         if (-not $node) { return $null }
+        # Reserved fixture fault, reachable ONLY under MockGraph; never live transport.
+        $fault = Get-NoteProp $node '__mockGetStatus'
+        if ($fault) { throw (New-GraphFailure ([int]$fault) '' 'offline fixture GET') }
         return $node
     }
     $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ItemId/permissions/$LinkId"
@@ -553,8 +581,6 @@ function Get-PermissionFresh([string]$DriveId, [string]$ItemId, [string]$LinkId)
 }
 
 function Test-PermissionAllowlisted($perm, [string]$ExpectedLinkId) {
-    # Allowlist: anonymous + edit/write + not inherited + id still matches CSV LinkId.
-    # Anything else is SKIP — never DELETE on a shape we did not explicitly approve.
     if (-not $perm) { return @{ Ok = $false; Reason = 'Permission not found (already removed or wrong id)' } }
     $liveId = [string](Get-NoteProp $perm 'id')
     if ($liveId -ne $ExpectedLinkId) { return @{ Ok = $false; Reason = "Permission id mismatch live='$liveId' expected='$ExpectedLinkId'" } }
@@ -573,171 +599,155 @@ function Test-PermissionAllowlisted($perm, [string]$ExpectedLinkId) {
     $linkType = [string](Get-NoteProp $link 'type')
     $isEdit = ($linkType -eq 'edit')
     $roles = Get-NoteProp $perm 'roles'
-    if (-not $isEdit -and $roles) {
-        $isEdit = (@($roles) -match '(?i)^write$').Count -gt 0
-    }
+    # Fail closed: write role alone must not make a view/unknown link deletable.
     if (-not $isEdit) {
         return @{ Ok = $false; Reason = "Not an edit/write link (type='$linkType', roles=$($roles -join ';'))" }
     }
     return @{ Ok = $true; Reason = 'anonymous edit, not inherited, id matches' }
 }
 
-function Remove-PermissionSafe([string]$DriveId, [string]$ItemId, [string]$LinkId) {
-    # Precondition: caller already validated allowlist via fresh GET
-    if ($MockGraph) {
-        [void]$script:DeletedMock.Add($LinkId)
-        return @{ StatusCode = 204; Skipped = $false }
-    }
+function Add-MutationJournal([string]$Key,[string]$Event,[int]$Status=0) {
+    $entry = @{Key=$Key;Event=$Event;Status=$Status;Utc=[datetime]::UtcNow.ToString('o');RunId=$runId}
+    $entry | ConvertTo-Json -Compress | Add-Content -LiteralPath $journalFile -WhatIf:$false -ErrorAction Stop
+}
+function Remove-PermissionSafe([string]$DriveId,[string]$ItemId,[string]$LinkId) {
+    $key = "$DriveId|$ItemId|$LinkId"
     $uri = "https://graph.microsoft.com/v1.0/drives/$DriveId/items/$ItemId/permissions/$LinkId"
     $attempt = 0
     while ($true) {
         $attempt++
-        # Fresh confirm before every DELETE attempt (including retries)
         $perm = Get-PermissionFresh $DriveId $ItemId $LinkId
+        if ($null -eq $perm) { return @{StatusCode=404;Skipped=$false;AlreadyAbsent=$true} }
         $check = Test-PermissionAllowlisted $perm $LinkId
-        if (-not $check.Ok) {
-            return @{ StatusCode = 0; Skipped = $true; Reason = "Pre-DELETE recheck failed: $($check.Reason)" }
-        }
+        if (-not $check.Ok) { return @{StatusCode=0;Skipped=$true;Reason="Pre-DELETE recheck failed: $($check.Reason)"} }
+        # Durable ATTEMPT BEFORE mutation. A crash/timeout must never trigger blind replay.
+        Add-MutationJournal $key 'ATTEMPT'
         try {
-            $delResp = Invoke-Graph -Method DELETE -Uri $uri -MaxRetry 1
-            $delCode = 204
-            if ($null -ne $delResp) {
-                $p = $delResp.PSObject.Properties['StatusCode']
-                if ($null -ne $p -and $null -ne $p.Value) { $delCode = [int]$p.Value }
-            }
-            if ($delCode -eq 404) {
-                return @{ StatusCode = 404; Skipped = $false; Reason = 'Already gone at DELETE time' }
-            }
-            return @{ StatusCode = $delCode; Skipped = $false }
+            if ($MockGraph) {
+                [void]$script:DeletedMock.Add($LinkId); $del = [pscustomobject]@{StatusCode=204}
+            } else { $del = Invoke-Graph -Method DELETE -Uri $uri -MaxRetry 0 }
+            Add-MutationJournal $key 'RESPONSE' ([int]$del.StatusCode)
+            return @{StatusCode=[int]$del.StatusCode;Skipped=$false;AlreadyAbsent=($del.StatusCode -eq 404)}
         } catch {
-            $err = $_
-            $status = Get-HttpStatusFromError $err
-            if ($status -in 429, 503, 504 -and $attempt -le $MaxDeleteRetries) {
-                Write-Log "DELETE throttled ($status); will re-GET and retry ($attempt/$MaxDeleteRetries)" 'WARN'
-                Start-Sleep -Seconds ([math]::Min(60, [math]::Pow(2, $attempt)))
-                continue
+            $err = $_; $info = Get-HttpFailureInfo $err
+            # Timeout/503/429 can follow a successful mutation: GET FIRST, even when
+            # no retry will be permitted. A failed verification never authorizes retry.
+            try { $after = Get-PermissionFresh $DriveId $ItemId $LinkId }
+            catch { throw (New-GraphFailure $info.StatusCode $info.RetryAfter 'ambiguous DELETE; verification failed') }
+            if ($null -eq $after) {
+                return @{StatusCode=$info.StatusCode;Skipped=$false;AlreadyAbsent=$false;Recovered=$true}
             }
-            if ($status -eq 404) { return @{ StatusCode = 404; Skipped = $false; Reason = 'Already gone at DELETE time' } }
-            throw
+            if ($info.StatusCode -in @(429,503,504) -and $attempt -le $MaxDeleteRetries) {
+                Wait-GraphRetry $info.RetryAfter $attempt
+                continue # next iteration performs a fresh full allowlist check
+            }
+            throw $err # includes auth401/403 and ambiguous transport0: stop, no retry
         }
     }
 }
 
-# ---------- Process ----------
-$plan = [System.Collections.Generic.List[object]]::new()
-$skipped = [System.Collections.Generic.List[object]]::new()
-$results = [System.Collections.Generic.List[object]]::new()
-
-if (-not $MockGraph) {
-    # Force token + role check early (fail before any plan noise if auth/roles wrong)
-    $null = Get-GraphToken $S
+# ---------- Incremental processing, durable checkpoints, truthful final counts ----------
+$plan = [Collections.Generic.List[object]]::new()
+$skipped = [Collections.Generic.List[object]]::new()
+$results = [Collections.Generic.List[object]]::new()
+$pendingMutations = [Collections.Generic.HashSet[string]]::new()
+if (Test-Path $journalFile) {
+    foreach ($line in Get-Content $journalFile) {
+        $j = $line | ConvertFrom-Json -ErrorAction Stop
+        if ($j.Event -eq 'ATTEMPT') { [void]$pendingMutations.Add($j.Key) }
+        elseif ($j.Event -eq 'VERIFIED') { [void]$pendingMutations.Remove($j.Key) }
+    }
 }
-
-# Safety gate: DELETE only when -Execute is set AND -WhatIf is not. Default path is DRY-RUN.
 $mode = if ($Execute -and -not $WhatIfPreference) { 'EXECUTE' } else { 'DRY-RUN' }
-Write-Log "Mode=$mode (Execute switch=$Execute, WhatIf=$WhatIfPreference). DELETE only in EXECUTE." 'PLAN'
-
-$i = 0
-foreach ($r in $candidates) {
-    $i++
-    $driveId = [string]$r.DriveId
-    $itemId = [string]$r.ItemId
-    $linkId = [string]$r.LinkId
-    $key = "$driveId|$itemId|$linkId"
-    Write-Log "[$i/$($candidates.Count)] Inspect $linkId on item $itemId"
-
-    try {
-        $perm = Get-PermissionFresh $driveId $itemId $linkId
-    } catch {
-        $msg = $_.ToString()
-        if ($_.PSObject.Properties.Name -contains 'Message') { $msg = $_.Message }
-        $skipped.Add([pscustomobject]@{
-                LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'SKIP'
-                Reason = "GET failed: $msg"; ItemName = $r.ItemName; SiteUrl = $r.SiteUrl
-            }) | Out-Null
-        Write-Log "GET failed for $linkId : $msg" 'ERROR'
-        continue
-    }
-
-    $check = Test-PermissionAllowlisted $perm $linkId
-    if (-not $check.Ok) {
-        $skipped.Add([pscustomobject]@{
-                LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'SKIP'
-                Reason = $check.Reason; ItemName = $r.ItemName; SiteUrl = $r.SiteUrl
-            }) | Out-Null
-        Write-Log "SKIP $linkId — $($check.Reason)" 'WARN'
-        Add-Content -LiteralPath $doneFile -Value $key -WhatIf:$false   # do not retry forever on permanent skip
-        continue
-    }
-
-    $linkObj = Get-NoteProp $perm 'link'
-    $liveLinkUrl = Get-NoteProp $linkObj 'webUrl'
-    if (-not $liveLinkUrl) { $liveLinkUrl = $r.LinkUrl }
-    $plan.Add([pscustomobject]@{
-            LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'WOULD_DELETE'
-            Reason = $check.Reason; LinkType = (Get-NoteProp $linkObj 'type'); Scope = (Get-NoteProp $linkObj 'scope')
-            ItemName = $r.ItemName; SiteUrl = $r.SiteUrl; LinkUrl = $liveLinkUrl
-        }) | Out-Null
-
-    # Second gate: SupportsShouldProcess (ConfirmImpact High). -WhatIf or declining Confirm => plan only.
-    $target = "permission $linkId on drives/$driveId/items/$itemId"
-    $shouldDelete = $Execute -and -not $WhatIfPreference -and $PSCmdlet.ShouldProcess($target, 'DELETE sharing permission (Anyone edit link)')
-
-    if (-not $shouldDelete) {
-        Write-Log "PLAN WOULD_DELETE $linkId ($($check.Reason))" 'PLAN'
-        $results.Add([pscustomobject]@{
-                LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'WOULD_DELETE'
-                Status = 'dry-run'; Detail = $check.Reason; VerifiedGone = ''
-            }) | Out-Null
-        # Dry-run does not mark done (so a later -Execute can process them)
-        continue
-    }
-
-    try {
-        $del = Remove-PermissionSafe $driveId $itemId $linkId
-        if ($del.ContainsKey('Skipped') -and $del.Skipped) {
-            $skipped.Add([pscustomobject]@{
-                    LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'SKIP'
-                    Reason = $del.Reason; ItemName = $r.ItemName; SiteUrl = $r.SiteUrl
-                }) | Out-Null
-            Write-Log "SKIP at DELETE time $linkId — $($del.Reason)" 'WARN'
-            Add-Content -LiteralPath $doneFile -Value $key -WhatIf:$false
-            continue
-        }
-        # Verify
-        Start-Sleep -Milliseconds 200
-        $after = Get-PermissionFresh $driveId $itemId $linkId
-        $gone = ($null -eq $after)
-        $action = if ($gone) { 'DELETED' } else { 'DELETE_UNVERIFIED' }
-        $results.Add([pscustomobject]@{
-                LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = $action
-                Status = $del.StatusCode; Detail = $(if ($gone) { 'GET after DELETE returned 404/null' } else { 'Permission still present after DELETE' })
-                VerifiedGone = $gone
-            }) | Out-Null
-        Write-Log "$action $linkId verifiedGone=$gone" $(if ($gone) { 'OK' } else { 'ERROR' })
-        Add-Content -LiteralPath $doneFile -Value $key -WhatIf:$false
-    } catch {
-        $msg = $_.ToString()
-        $results.Add([pscustomobject]@{
-                LinkId = $linkId; DriveId = $driveId; ItemId = $itemId; Action = 'DELETE_FAILED'
-                Status = 'error'; Detail = $msg; VerifiedGone = $false
-            }) | Out-Null
-        Write-Log "DELETE_FAILED $linkId — $msg" 'ERROR'
-        # Do not append done.txt — allow resume retry after operator review
-    }
-
-    Add-Content -LiteralPath $progressFile -Value ("{0:o} done={1} planned={2} skipped={3}" -f (Get-Date).ToUniversalTime(), $results.Count, $plan.Count, $skipped.Count) -WhatIf:$false
+$processed=0; $failed=0; $paused=$false; $fatal=$null
+function Save-Row($row) {
+    $row | Export-Csv -LiteralPath $resultCsv -Append -NoTypeInformation -Encoding utf8 -WhatIf:$false -ErrorAction Stop
+    $results.Add($row)
 }
-
-# ---------- Persist ----------
-if ($plan.Count) { $plan | Export-Csv -LiteralPath $planCsv -NoTypeInformation -Encoding utf8 -WhatIf:$false }
-if ($skipped.Count) { $skipped | Export-Csv -LiteralPath $skipCsv -NoTypeInformation -Encoding utf8 -WhatIf:$false }
-if ($results.Count) { $results | Export-Csv -LiteralPath $resultCsv -NoTypeInformation -Encoding utf8 -WhatIf:$false }
-
-$deleted = @($results | Where-Object Action -eq 'DELETED').Count
-$would = @($results | Where-Object Action -eq 'WOULD_DELETE').Count
-$failed = @($results | Where-Object Action -in @('DELETE_FAILED', 'DELETE_UNVERIFIED')).Count
-Write-Log ("Finished mode={0}. WOULD_DELETE={1} DELETED={2} FAILED/UNVERIFIED={3} SKIPPED={4}. Output={5}" -f $mode, $would, $deleted, $failed, $skipped.Count, $OutputFolder) 'OK'
-
-if ($failed -gt 0) { exit 1 }
+function Save-Progress {
+    $summary = [ordered]@{
+        RunId=$runId;Mode=$mode;InputSHA256=$inputHash;Total=$candidates.Count;Processed=$processed;Remaining=($candidates.Count-$processed)
+        ResumedCompleted=$resumedCount;EligibleChecked=$plan.Count
+        WouldDelete=@($results | Where-Object Action -eq 'WOULD_DELETE').Count
+        DeletedVerified=@($results | Where-Object Action -eq 'DELETED').Count
+        AlreadyAbsent=@($results | Where-Object Action -eq 'ALREADY_ABSENT').Count
+        Skipped=@($results | Where-Object Action -eq 'SKIP').Count;Errors=$failed
+        Paused=$paused;Completed=($processed -eq $candidates.Count -and -not $paused)
+        UpdatedUtc=[datetime]::UtcNow.ToString('o');StartedUtc=$runStarted.ToString('o')
+    }
+    $summary | ConvertTo-Json | Set-Content ($summaryFile+'.tmp') -WhatIf:$false -ErrorAction Stop
+    Move-Item ($summaryFile+'.tmp') $summaryFile -Force -WhatIf:$false -ErrorAction Stop
+    $line = "Processed=$processed/$($candidates.Count) DeletedVerified=$($summary.DeletedVerified) AlreadyAbsent=$($summary.AlreadyAbsent) WouldDelete=$($summary.WouldDelete) Skipped=$($summary.Skipped) Errors=$failed Remaining=$($summary.Remaining)"
+    Add-Content $progressFile -Value ($summary.UpdatedUtc+' '+$line) -WhatIf:$false -ErrorAction Stop
+    Write-Progress -Activity "Sharing permission $mode (sequential)" -Status $line -PercentComplete $(if($candidates.Count){100*$processed/$candidates.Count}else{100})
+    Write-Log $line
+}
+try {
+    if (-not $MockGraph) { $null=Get-GraphToken $S }
+    Write-Log "Mode=$mode; requests sequential (ThrottleLimit is reserved, not active parallelism). No DELETE in dry-run/WhatIf."
+    Save-Progress
+    foreach ($r in $candidates) {
+        if ([datetime]::UtcNow -ge $runDeadline) { $paused=$true; $failed++; break }
+        $driveId=[string]$r.DriveId; $itemId=[string]$r.ItemId; $linkId=[string]$r.LinkId
+        $key="$driveId|$itemId|$linkId"
+        Write-Log "[$($processed+1)/$($candidates.Count)] GET exact permission $linkId; checking current shape."
+        $row=[pscustomobject]@{RunId=$runId;LinkId=$linkId;DriveId=$driveId;ItemId=$itemId;Action='';Status='';Detail='';VerifiedGone=''}
+        try {
+            $perm=Get-PermissionFresh $driveId $itemId $linkId
+            if ($null -eq $perm) {
+                $row.Action='ALREADY_ABSENT';$row.Status=404;$row.Detail='Exact permission404, no DELETE required';$row.VerifiedGone=$true
+                if ($mode -eq 'EXECUTE') {
+                    Add-Content $doneFile $key -WhatIf:$false -ErrorAction Stop
+                    if($pendingMutations.Contains($key)){Add-MutationJournal $key 'VERIFIED' 404}
+                }
+                Save-Row $row;continue
+            }
+            if($pendingMutations.Contains($key)) { throw (New-GraphFailure 0 '' 'unresolved previous mutation: permission still present; operator review required') }
+            $check=Test-PermissionAllowlisted $perm $linkId
+            if(-not $check.Ok){
+                $row.Action='SKIP';$row.Detail=$check.Reason
+                $row | Select-Object LinkId,DriveId,ItemId,Action,@{n='Reason';e={$_.Detail}} | Export-Csv $skipCsv -Append -NoTypeInformation -WhatIf:$false -ErrorAction Stop
+                $skipped.Add($row);Save-Row $row;continue
+            }
+            $linkObj=Get-NoteProp $perm 'link'
+            $planRow=[pscustomobject]@{LinkId=$linkId;DriveId=$driveId;ItemId=$itemId;Action='WOULD_DELETE';Reason=$check.Reason;LinkType=(Get-NoteProp $linkObj 'type');Scope=(Get-NoteProp $linkObj 'scope');ItemName=(Get-NoteProp $r 'ItemName');SiteUrl=(Get-NoteProp $r 'SiteUrl');LinkUrl=(Get-NoteProp $linkObj 'webUrl')}
+            $plan.Add($planRow);$planRow | Export-Csv $planCsv -Append -NoTypeInformation -Encoding utf8 -WhatIf:$false -ErrorAction Stop
+            # Approval semantics unchanged: explicit Execute AND ShouldProcess; WhatIf never mutates.
+            if(-not ($Execute -and -not $WhatIfPreference -and $PSCmdlet.ShouldProcess("permission $linkId on drive/item $driveId/$itemId",'DELETE Anyone edit sharing permission'))){
+                $row.Action='WOULD_DELETE';$row.Status='dry-run';$row.Detail=$check.Reason;Save-Row $row;continue
+            }
+            $del=Remove-PermissionSafe $driveId $itemId $linkId
+            if($del.Skipped){$row.Action='SKIP';$row.Detail=$del.Reason;Save-Row $row;continue}
+            # Explicit404 only. Never infer successful removal from empty200/transport error.
+            $after=Get-PermissionFresh $driveId $itemId $linkId
+            if($null -ne $after){throw (New-GraphFailure 0 '' 'DELETE response received but permission still present')}
+            $row.Action=if($del.AlreadyAbsent){'ALREADY_ABSENT'}else{'DELETED'}
+            $row.Status=$del.StatusCode;$row.Detail='Exact GET verification returned404';$row.VerifiedGone=$true
+            Add-MutationJournal $key 'VERIFIED' 404
+            # Checkpoint only confirmed terminal state; changed/inherited/error are never done.
+            Add-Content $doneFile $key -WhatIf:$false -ErrorAction Stop
+            Save-Row $row
+            Write-Log "$($row.Action) $linkId; HTTP=$($row.Status), verified absent404." 'OK'
+        } catch {
+            $status=Get-HttpStatusFromError $_
+            $failed++;$paused=$true
+            $row.Action='ERROR';$row.Status=$status
+            $row.Detail=if($status -in @(401,403)){'Authorization failure: stop; do not add privileges automatically'}else{'Request/mutation/checkpoint failure: stop; inspect journal before any retry'}
+            # Deliberately omit raw exception/body/token/URL strings from logs.
+            Save-Row $row;Write-Log "$($row.Detail) HTTP=$status Type=$($_.Exception.GetType().Name)" 'ERROR'
+        } finally {
+            $processed++;Save-Progress # runs even on continue/skip/error: no silent dry-run stall
+        }
+        if($paused){break}
+    }
+} catch {
+    $failed++;$paused=$true;$fatal=$_.Exception.GetType().Name
+    Write-Log "Fatal initialization/persistence failure Type=$fatal; stopped. No success inferred." 'ERROR'
+} finally {
+    Save-Progress
+    Write-Progress -Activity "Sharing permission $mode (sequential)" -Completed
+    $label=if($paused){'PAUSED/INCOMPLETE'}else{'FINISHED'}
+    Write-Log "$label mode=$mode; inspect summary.json, incremental CSVs, done.txt and mutation_journal.jsonl. No further batch is authorized by this result." $(if($failed){'ERROR'}else{'OK'})
+}
+if($failed -gt 0 -or $paused){exit 1}
 exit 0

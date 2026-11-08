@@ -1,6 +1,8 @@
+> **1.1.0-preview.1 — offline validation only.** This generic update passed 39 offline assertions; it has not been live-tested. Production operations performed with a separate purpose-specific executor are not validation of this preview. Test in a non-production tenant first. See [safety/progress semantics](docs/SAFETY_AND_PROGRESS.md).
+
 # Remove "Anyone" edit sharing links in SharePoint Online and OneDrive
 
-**Applies to:** SharePoint Online, OneDrive for Business, Microsoft Graph v1.0 · **Scripts:** `Remove-AnyoneLink.ps1` v1.0.0 · `Grant-SitesSelectedWrite.ps1` v1.0.0 · **Updated:** 2026-11-05 · **Access:** **CHANGES TENANT STATE** (deletes sharing permissions)
+**Applies to:** SharePoint Online, OneDrive for Business, Microsoft Graph v1.0 · **Scripts:** `Remove-AnyoneLink.ps1` v1.1.0-preview.1 · `Grant-SitesSelectedWrite.ps1` v1.0.0 · **Updated:** 2026-11-07 · **Access:** **CHANGES TENANT STATE** (deletes sharing permissions)
 
 > **This tool mutates the tenant.** It deletes Microsoft Graph `permission` objects that represent **Anyone (anonymous) edit** sharing links. It does **not** delete files, folders, or sites. Deleting a sharing link **cannot restore the same URL** — owners must create a new link if access is still required.
 >
@@ -191,6 +193,11 @@ Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
 | `-AllowedPermissionIds` | no | Files.ReadWrite.All GUID | Token role allowlist |
 | `-DeniedPermissionIds` | no | FullControl + Manage.All | Token role denylist |
 | `-NonInteractive` | no | off | Fail instead of prompting |
+| `-RequestTimeoutSeconds` | no | 30 | Per-call connection/operation limits; not a hard watchdog |
+| `-MaxRetryDelaySeconds` | no | 60 | Pause if server backoff exceeds budget |
+| `-MaxRunSeconds` | no | 3600 | Cooperative overall budget |
+| `-MaxDeleteRetries` | no | 1 | Transient-only, verified and freshly guarded replay |
+| `-ThrottleLimit` | no | 2 | Reserved compatibility parameter; requests are sequential |
 | `-Help` | no | | Full comment-based help |
 
 \* Prompted when missing, unless `-NonInteractive` (or `-MockGraph` for auth values).
@@ -202,11 +209,20 @@ Review `would_delete.csv` and `skipped.csv`. Nothing is deleted.
 | `would_delete.csv` | Rows that passed live allowlist checks |
 | `skipped.csv` | Inherited / wrong scope / missing / GET errors |
 | `removal_results.csv` | Dry-run plans and (if `-Execute`) delete outcomes |
-| `done.txt` | Resume keys (`DriveId\|ItemId\|LinkId`) |
+| `done.txt` | Verified terminal execution checkpoints only; no dry-run/skip entries |
+| `input_sha256.txt` | Binds output folder to exact input bytes |
+| `mutation_journal.jsonl` | Durable attempt/response/verified journal |
+| `summary.json` | Atomic per-row counts and completion/pause state |
 | `run_*.log` | Full log |
 | `progress.txt` | Heartbeat counters |
 
-`Action` values include `WOULD_DELETE`, `DELETED`, `DELETE_FAILED`, `DELETE_UNVERIFIED`, `SKIP`. Prefer verifying `DELETED` with `VerifiedGone=True`.
+`Action` values: `WOULD_DELETE`, `DELETED`, `ALREADY_ABSENT`, `ERROR`, `SKIP`.
+`Completed` means all selected rows were examined, not that all were deleted.
+Errors/auth failures pause with nonzero exit. An unresolved prior mutation requires
+operator review; do not remove its journal merely to force a replay. Default dry-run
+and `-WhatIf` never create mutation checkpoints. Reusing an output folder with changed
+input bytes fails; use a new folder. Run one writer per folder. Local checkpoint
+files are not a multi-file transaction; retain them together and inspect storage errors.
 
 ## 9. Clean up (security)
 
@@ -246,20 +262,20 @@ See also [BEST_PRACTICES.md](../../BEST_PRACTICES.md) (§11 write tools, §12 pu
 | Token contains DENIED role | Removal app has FullControl/Manage — remove it |
 | Token roles do not include AllowedPermissionIds | Consent `Files.ReadWrite.All` or pass Sites.Selected GUID in `-AllowedPermissionIds` |
 | Many SKIP inherited | Expected for child items under a shared folder — delete the folder link instead |
-| `DELETE_FAILED` | Check `run_*.log`; script does not mark `done.txt` so you can retry after review |
+| `ERROR` / paused | Inspect sanitized log, mutation journal and exact state before any retry; never blindly replay an uncertain DELETE |
 | 403 on personal OneDrive with Sites.Selected | Grant write on that site with an app-only FullControl bootstrap, or use Files.ReadWrite.All |
 
 ## FAQ
 
 **Does dry-run delete anything?** No.
 
-**Can the same Anyone URL come back after DELETE?** No. A new link is a new permission (new URL).
+**Can the same Anyone URL come back after DELETE?** Do not promise restoration of the identical URL. Replacement access/new links are not a guaranteed undo.
 
 **Can I reuse the inventory app?** No. Keep read and write apps separate.
 
 **Does this delete files?** No. Only the sharing permission (the link).
 
-**Does it remove Anyone *view* links?** Not by default (`-RequireAnonymousEdit $true`). Filter a separate CSV if you intentionally target view links later.
+**Does it remove Anyone *view* links?** No. Fresh live checks always require anonymous scope, edit type and no inheritedFrom; a write role alone is insufficient.
 
 ## Sources and credits
 
@@ -269,6 +285,6 @@ See also [BEST_PRACTICES.md](../../BEST_PRACTICES.md) (§11 write tools, §12 pu
 
 ## Changelog
 
-See the `.NOTES` section of each script (`Get-Help .\Remove-AnyoneLink.ps1 -Full`).
+See [CHANGELOG.md](CHANGELOG.md) and `.NOTES` (`Get-Help .\Remove-AnyoneLink.ps1 -Full`).
 
 License: [MIT](../../LICENSE). Provided as-is; test in a non-production tenant first.
