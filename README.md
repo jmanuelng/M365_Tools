@@ -7,7 +7,7 @@ A collection of practical, generic PowerShell tools for Microsoft 365 administra
 | Area | Tool | Description | Access |
 |---|---|---|---|
 | SharePoint / OneDrive | [anyone-link-inventory](sharepoint/anyone-link-inventory/) | Inventory every "Anyone" (anonymous) sharing link in the tenant to CSV. Resumable, throttling-aware, parallel. | Read-only (Graph `Sites.Read.All`) |
-| SharePoint / OneDrive | [anyone-link-removal](sharepoint/anyone-link-removal/) | Remove **Anyone edit** sharing-link permissions from a filtered inventory CSV. Preview 1.1.0-preview.1: guarded checkpoints/progress, offline-tested only. Dry-run by default; `-Execute` opt-in. | **Mutates** (Graph `Files.ReadWrite.All`; or `Sites.Selected` + per-site write) |
+| SharePoint / OneDrive | [anyone-link-removal](sharepoint/anyone-link-removal/) | Remove **Anyone edit** sharing-link permissions from a filtered inventory CSV. Preview 1.1.0-preview.2: bounded read recovery, journal resume + item-retention verification, offline-tested only. Dry-run by default; `-Execute` opt-in. | **Mutates** (Graph `Files.ReadWrite.All`; or `Sites.Selected` + per-site write) |
 | Entra ID | [entra/](entra/) | Coming soon | |
 | Exchange Online | [exchange/](exchange/) | Coming soon | |
 | Intune | [intune/](intune/) | Coming soon | |

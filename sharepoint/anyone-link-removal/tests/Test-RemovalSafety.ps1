@@ -13,18 +13,19 @@ $pwsh=(Get-Process -Id $PID).Path
 $failed=0;$passed=0
 function Check($ok,$name){if($ok){$script:passed++;Write-Host "PASS $name"}else{$script:failed++;Write-Host "FAIL $name"}}
 $ast=[Management.Automation.Language.Parser]::ParseFile($tool,[ref]$null,[ref]$null)
-$names=@('Get-NoteProp','Get-HttpFailureInfo','Get-HttpStatusFromError','New-GraphFailure','Get-RetryDelay','Wait-GraphRetry','Invoke-Graph','Get-PermissionFresh','Test-PermissionAllowlisted','Add-MutationJournal','Remove-PermissionSafe')
+$names=@('Get-NoteProp','Get-HttpFailureInfo','Get-HttpStatusFromError','New-GraphFailure','Get-RetryDelay','Wait-GraphRetry','Invoke-Graph','Get-PermissionFresh','Test-PermissionAllowlisted','Add-MutationJournal','Remove-PermissionSafe','Assert-RunBudget','Write-DurableJson','Add-RequestReceipt','Assert-ItemPresent','Confirm-PermissionGone')
 foreach($fn in $ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)){
  if($fn.Name -in $names){. ([scriptblock]::Create($fn.Extent.Text))}
 }
 function Write-Log {param($Msg,$Level)}
 function Get-GraphToken {param($S) return 'OFFLINE_FAKE_TOKEN'}
 function Start-Sleep {param($Seconds) $script:waits+=,[double]$Seconds}
-$MockGraph=$false;$ScriptVersion='offline-test';$RequestTimeoutSeconds=2;$MaxRetryDelaySeconds=60;$MaxDeleteRetries=1
+$MockGraph=$false;$MaxReadRetries=3;$MaxVerificationPolls=3;$MaxRunSeconds=300;$runStarted=[datetime]::UtcNow;$runClock=[Diagnostics.Stopwatch]::StartNew();$script:CurrentKey='';$script:CurrentPhase='offline';$ScriptVersion='offline-test';$RequestTimeoutSeconds=2;$MaxRetryDelaySeconds=60;$MaxDeleteRetries=1
 $S=@{LastActivity=[datetime]::UtcNow};$runDeadline=[datetime]::UtcNow.AddMinutes(5);$runId='offline'
 $temp=Join-Path ([IO.Path]::GetTempPath()) ('removal-offline-'+[guid]::NewGuid())
 New-Item -ItemType Directory $temp | Out-Null
 $journalFile=Join-Path $temp 'journal.jsonl'
+$requestReceiptFile=Join-Path $temp 'requests.jsonl'
 function Reset-Queue($q){$script:queue=[Collections.Generic.Queue[object]]::new();foreach($v in $q){$script:queue.Enqueue($v)};$script:calls=@();$script:waits=@()}
 function Invoke-WebRequest {
  param($Method,$Uri,$Headers,[switch]$SkipHttpErrorCheck,$ConnectionTimeoutSeconds,$OperationTimeoutSeconds,$ErrorAction)
@@ -57,13 +58,13 @@ $e=New-GraphFailure 429 '12' 'offline';$info=Get-HttpFailureInfo $e
 Check ($info.StatusCode -eq 429 -and $info.RetryAfter -eq '12') 'structured status and RetryAfter survive terminating throw'
 Reset-Queue @((Response 401));$status=0;try{$null=Invoke-Graph GET 'https://graph.microsoft.com/v1.0/offline'}catch{$status=Get-HttpStatusFromError $_}
 Check ($status -eq 401 -and $calls.Count -eq 1) 'authorization401 terminates without retry'
-Reset-Queue @((Response 200 $perm),[TimeoutException]::new('offline'),(Response 404))
+Reset-Queue @((Response 200 $perm),[TimeoutException]::new('offline'),(Response 404),(Response 200 '{"id":"i1"}'))
 $x=Remove-PermissionSafe 'd1' 'i1' 'p1'
 Check ($x.Recovered -and @($calls | Where-Object {$_ -eq 'DELETE'}).Count -eq 1) 'ambiguous timeout verified absent before any replay; only one DELETE'
-Reset-Queue @((Response 200 $perm),(Response 429 '' '0'),(Response 200 $perm),(Response 200 $perm),(Response 204))
+Reset-Queue @((Response 200 $perm),(Response 429 '' '0'),(Response 200 $perm),(Response 200 '{"id":"i1"}'),(Response 200 $perm),(Response 204))
 $x=Remove-PermissionSafe 'd1' 'i1' 'p1'
-Check ($x.StatusCode -eq 204 -and ($calls -join ',') -eq 'GET,DELETE,GET,GET,DELETE') 'mutation429 retry has verification AND full fresh allowlist first'
-Reset-Queue @((Response 200 $perm),[TimeoutException]::new('offline'),(Response 200 $perm))
+Check ($x.StatusCode -eq 204 -and ($calls -join ',') -eq 'GET,DELETE,GET,GET,GET,DELETE') 'mutation429 retry has verification AND full fresh allowlist first'
+Reset-Queue @((Response 200 $perm),[TimeoutException]::new('offline'),(Response 200 $perm),(Response 200 '{"id":"i1"}'))
 $threw=$false;try{$null=Remove-PermissionSafe 'd1' 'i1' 'p1'}catch{$threw=$true}
 Check ($threw -and @($calls | Where-Object {$_ -eq 'DELETE'}).Count -eq 1) 'timeout with permission still present stops; no blind retry'
 $x=('{"id":"p1","link":{"scope":"anonymous","type":"view"},"roles":["write"]}' | ConvertFrom-Json)
@@ -72,6 +73,7 @@ Check (-not (Test-PermissionAllowlisted $x 'p1').Ok) 'view link plus write role 
 function Run-Mock($folder,$extra=@(),$mockPath=''){
  $args=@('-NoProfile','-File',$tool,'-MockGraph','-InputCsv',(Join-Path $root 'mocks/sample_input.csv'),'-OutputFolder',$folder,'-NonInteractive')+$extra
  if($mockPath){$args+=@('-MockPermissionsPath',$mockPath)}
+ if(Test-Path (Join-Path $folder 'mutation_journal.jsonl')){$args+='-Resume'}
  & $pwsh @args *> (Join-Path $temp 'last_integration.log')
  return $LASTEXITCODE
 }
@@ -95,6 +97,7 @@ $pending=Join-Path $temp 'pending';New-Item -ItemType Directory $pending | Out-N
 # Derive key from fixture rather than relying on its drive name.
 $first=Import-Csv (Join-Path $root 'mocks/sample_input.csv') | Select-Object -First 1
 @{Key=($first.DriveId+'|'+$first.ItemId+'|'+$first.LinkId);Event='ATTEMPT'} | ConvertTo-Json -Compress | Set-Content (Join-Path $pending 'mutation_journal.jsonl')
+(Get-FileHash (Join-Path $root 'mocks/sample_input.csv') -Algorithm SHA256).Hash|Set-Content (Join-Path $pending 'input_sha256.txt')
 $code=Run-Mock $pending @('-Execute','-Confirm:$false')
 $summary=Get-Content (Join-Path $pending 'summary.json') -Raw | ConvertFrom-Json
 Check ($code -eq 1 -and $summary.DeletedVerified -eq 0 -and $summary.Errors -eq 1) 'restart with unresolved mutation refuses deletion pending operator review'
